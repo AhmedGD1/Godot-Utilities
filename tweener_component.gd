@@ -551,7 +551,7 @@ class SequenceStep:
 	
 	static func wait_step(dur: float) -> SequenceStep:
 		var step: SequenceStep = SequenceStep.new()
-		StepType.Wait
+		step.type = StepType.Wait
 		step.duration = dur
 		return step
 	
