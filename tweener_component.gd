@@ -468,12 +468,12 @@ class TweenSequence:
 	
 	func with_transition(trans: Tween.TransitionType) -> TweenSequence:
 		if !_steps.is_empty():
-			_steps[-1]["transition"] = trans
+			_steps[-1].transition_type = trans
 		return self
 	
 	func with_ease(ease_type: Tween.EaseType) -> TweenSequence:
 		if !_steps.is_empty():
-			_steps[-1]["ease_type"] = ease_type
+			_steps[-1].ease_type = ease_type
 		return self
 	
 	func start() -> void:
