@@ -164,6 +164,7 @@ func tween_curve(target: Object, property: String, curve_key: String, from: Vari
 	var group_speed: float = _group_speeds.get(group, 1.0)
 	var final_speed: float = group_speed * speed_scale
 	
+	new_tween.set_speed_scale(final_speed)
 	_add_tween_to_group(group, new_tween)
 	
 	new_tween.tween_method(_interpolate.bind(target, property, curve, from, to), 0.0, 1.0, duration / final_speed)
@@ -201,13 +202,10 @@ func _animate_internal_data(target: Object, data: TweenerData, internal: bool = 
 	
 	var group_speed: float = _group_speeds.get(data.group, 1.0)
 	var final_speed: float = group_speed * speed_scale
-	var new_durations: PackedFloat32Array = []
-	
-	for duration: float in data.durations:
-		new_durations.append(duration / final_speed)
+	new_tween.set_speed_scale(final_speed)
 	
 	for i: int in range(count):
-		new_tween.tween_property(target, data.property, data.values[i], new_durations[i])
+		new_tween.tween_property(target, data.property, data.values[i], data.durations[i])
 	# Modified callback to release data back to pool
 	new_tween.finished.connect(_check_tweener_callback_pooled.bind(new_tween, data.group, data.callback, data, internal))
 
@@ -449,7 +447,7 @@ class TweenSequence:
 	var _component: TweenerComponent
 	var _target: Object
 	var _group: String
-	var _steps: Array[Dictionary] = []
+	var _steps: Array[SequenceStep] = []
 	
 	func _init(component: TweenerComponent, target: Object, group: String):
 		_component = component
@@ -457,28 +455,15 @@ class TweenSequence:
 		_group = group
 	
 	func then(property: String, value: Variant, duration: float = 1.0) -> TweenSequence:
-		_steps.append({
-			"type": "animate",
-			"property": property,
-			"value": value,
-			"duration": duration,
-			"transition": _component.default_transition,
-			"ease_type": _component.default_ease
-		})
+		_steps.append(SequenceStep.animate(property, value, duration, _component.default_transition, _component.default_ease))
 		return self
 	
 	func wait(duration: float) -> TweenSequence:
-		_steps.append({
-			"type": "wait",
-			"duration": duration
-		})
+		_steps.append(SequenceStep.wait_step(duration))
 		return self
 	
 	func then_call(callback: Callable) -> TweenSequence:
-		_steps.append({
-			"type": "callback",
-			"callback": callback
-		})
+		_steps.append(SequenceStep.callback_step(callback))
 		return self
 	
 	func with_transition(trans: Tween.TransitionType) -> TweenSequence:
@@ -498,49 +483,104 @@ class TweenSequence:
 		if index >= _steps.size():
 			return
 		
-		var step = _steps[index]
+		var step: SequenceStep = _steps[index]
 		
 		match step.type:
-			"animate":
-				var transition = step.get("transition", _component.default_transition)
-				var ease_type = step.get("ease_type", _component.default_ease)
-				
+			SequenceStep.StepType.Animate:
 				_component.animate(
 					_target,
 					step.property,
 					[step.value],
 					[step.duration],
-					transition,
-					ease_type,
+					step.transition_type,
+					step.ease_type,
 					func(): _execute_next_step(index + 1),
 					_group
 				)
 			
-			"wait":
+			SequenceStep.StepType.Wait:
 				await _component._owner.get_tree().create_timer(step.duration).timeout
 				_execute_next_step(index + 1)
 			
-			"callback":
+			SequenceStep.StepType.Callback:
 				step.callback.call()
 				_execute_next_step(index + 1)
 	
 	# Convenience shortcuts
 	func bounce() -> TweenSequence:
-		if !_steps.is_empty():
-			_steps[-1]["transition"] = Tween.TRANS_BOUNCE
+		with_transition(Tween.TRANS_BOUNCE)
 		return self
 	
 	func elastic() -> TweenSequence:
-		if !_steps.is_empty():
-			_steps[-1]["transition"] = Tween.TRANS_ELASTIC
+		with_transition(Tween.TRANS_ELASTIC)
 		return self
 	
 	func spring() -> TweenSequence:
-		if !_steps.is_empty():
-			_steps[-1]["transition"] = Tween.TRANS_SPRING
+		with_transition(Tween.TRANS_SPRING)
 		return self
 	
 	func ease_in() -> TweenSequence:
-		if !_steps.is_empty():
-			_steps[-1]["ease_type"] = Tween.EASE_IN
+		with_ease(Tween.EASE_IN)
 		return self
+	
+	func ease_out() -> TweenSequence:
+		with_ease(Tween.EASE_OUT)
+		return self
+
+class SequenceStep:
+	enum StepType { Animate, Wait, Callback }
+	
+	var type: StepType
+	var property: String
+	var value: Variant
+	var duration: float = 1.0
+	var transition_type: Tween.TransitionType
+	var ease_type: Tween.EaseType
+	var callback: Callable
+	
+	static func animate(prop: String, val: Variant, dur: float, trans: Tween.TransitionType, eas: Tween.EaseType) -> SequenceStep:
+		var step: SequenceStep = SequenceStep.new()
+		step.type = StepType.Animate
+		step.property = prop
+		step.value = val
+		step.duration = dur
+		step.transition_type = trans
+		step.ease_type = eas
+		
+		return step
+	
+	static func wait_step(dur: float) -> SequenceStep:
+		var step: SequenceStep = SequenceStep.new()
+		StepType.Wait
+		step.duration = dur
+		return step
+	
+	static func callback_step(method: Callable) -> SequenceStep:
+		var step: SequenceStep = SequenceStep.new()
+		step.type = StepType.Callback
+		step.callback = method
+		return step
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
