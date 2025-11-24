@@ -1,88 +1,70 @@
 using Godot;
+using System;
 using System.Collections.Generic;
 
-public partial class BufferManager : Node
+public class BufferManager
 {
-    public static BufferManager Instance { get; private set; }
-
-    private readonly List<InputBuffer> buffers = [];
-
-    public override void _Ready()
-    {
-        if (Instance != null && Instance != this)
-        {
-            QueueFree();
-            return;
-        }
-        Instance = this;
-    }
+    private readonly List<InputBuffer> buffers = new();
 
     public void BufferAction(string action, float duration)
     {
-        InputBuffer existing = GetValidBuffer(action);
-        
+        InputBuffer existing = buffers.Find(b => b.Action == action);
+
         if (existing != null)
         {
             existing.SetDuration(duration);
             return;
         }
-
         InputBuffer buffer = new InputBuffer(action, duration);
         buffers.Add(buffer);
     }
 
     public bool HasAction(string action)
     {
-        return GetValidBuffer(action) != null;
+        return buffers.Find(b => b.Action == action && b.IsValid) != null;
     }
 
     public bool TryConsume(string action)
     {
-        InputBuffer inputBuffer = GetValidBuffer(action);
+        InputBuffer inputBuffer = buffers.Find(b => b.Action == action && b.IsValid);
 
-        if (inputBuffer == null) 
+        if (inputBuffer == null)
             return false;
         buffers.Remove(inputBuffer);
         return true;
     }
 
-    public override void _PhysicsProcess(double delta)
+    public void Update(float delta)
     {
-        bool anyExpired = false;
-        foreach (InputBuffer buffer in buffers)
+        for (int i = buffers.Count - 1; i >= 0; i--)
         {
-            buffer.Update(delta);
-            if (!buffer.IsValid) anyExpired = true;
+            buffers[i].Update(delta);
+
+            if (!buffers[i].IsValid)
+                buffers.RemoveAt(i);
         }
-        if (anyExpired)
-            buffers.RemoveAll(b => !b.IsValid);
     }
 
-    private InputBuffer GetValidBuffer(string action)
+    public class InputBuffer
     {
-        return buffers.Find(b => b.BufferedAction == action && b.IsValid);
-    }
-    
-    private class InputBuffer
-    {
-        public string BufferedAction { get; private set; }
+        public string Action { get; private set; }
         public float ExpireTime { get; private set; }
 
         public bool IsValid => ExpireTime > 0f;
 
-        public void Update(double delta)
+        public void SetDuration(float duration)
         {
-            ExpireTime = Mathf.Max(ExpireTime - (float)delta, 0f);
+            ExpireTime = duration;
         }
 
-        public void SetDuration(float value)
+        public void Update(float delta)
         {
-            ExpireTime = value;
+            ExpireTime -= delta;
         }
 
         public InputBuffer(string action, float duration)
         {
-            BufferedAction = action;
+            Action = action;
             ExpireTime = duration;
         }
     }
