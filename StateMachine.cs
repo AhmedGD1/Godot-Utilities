@@ -1,15 +1,16 @@
-using Godot;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 
-public enum SMProcessMode
+namespace Godot.FSM;
+
+public enum FSMProcessMode
 {
     Physics,
     Idle
 }
 
-public enum SMLockMode
+public enum FSMLockMode
 {
     None,
     Full,
@@ -17,7 +18,9 @@ public enum SMLockMode
 }
 
 public class StateMachine<T> where T : Enum
-    {
+{
+    private const int MAX_QUEUED_TRANSITIONS = 50;
+
     public event Action<T, T> StateChanged;
     public event Action<T> TimeoutBlocked;
     public event Action<T> StateTimeout;
@@ -29,6 +32,7 @@ public class StateMachine<T> where T : Enum
     private Dictionary<T, List<Transition>> transitions = new();
     private List<Transition> globalTransitions = new();
     private List<Transition> cachedSortedTransitions = new();
+    private Queue<T> pendingTransitions = new();
 
     private State currentState;
 
@@ -36,8 +40,10 @@ public class StateMachine<T> where T : Enum
     private T previousId;
 
     private bool initialized;
+    private bool hasPreviousState;
     private bool paused;
     private bool transitionDirty = true;
+    private bool isTransitioning;
 
 
     private float stateTime;
@@ -85,7 +91,19 @@ public class StateMachine<T> where T : Enum
             initialized = false;
         
         if (currentState?.Id.Equals(id) ?? false)
-            Reset();
+        {
+            if (states.Count > 0)
+            {
+                SetInitialId(states.Values.First().Id);
+                Reset();
+            }
+            else
+            {
+                currentState = null;
+                initialized = false;
+                hasPreviousState = false;
+            }
+        }
 
         transitions.Remove(id);
 
@@ -98,6 +116,8 @@ public class StateMachine<T> where T : Enum
         }
 
         globalTransitions.RemoveAll(t => t.To.Equals(id));
+
+        ReSortTransitions();
         return true;
     }
 
@@ -110,8 +130,13 @@ public class StateMachine<T> where T : Enum
         }
 
         if (!initialized)
-            SetInitialId(states.Values.First().Id);
+        {
+            GD.PushWarning("State Machine not initialized - call SetInitialId() first");
+            return false;
+        }
+
         ChangeStateInternal(initialId);
+        hasPreviousState = false;
         previousId = default;
         return true;
     }
@@ -162,9 +187,9 @@ public class StateMachine<T> where T : Enum
 
     public bool TryGoBack()
     {
-        if (!states.ContainsKey(previousId) || (currentState?.IsLocked() ?? false))
+        if (!hasPreviousState || !states.ContainsKey(previousId) || (currentState?.IsLocked() ?? false))
         {
-            GD.PushError("Can't go back to previous state as it could be null or locked");
+            GD.PushError("Can't go back to previous state");
             return false;
         }
 
@@ -174,28 +199,59 @@ public class StateMachine<T> where T : Enum
 
     private void ChangeStateInternal(T id, bool ignoreExit = false)
     {
+        if (isTransitioning)
+        {
+            if (pendingTransitions.Count >= MAX_QUEUED_TRANSITIONS)
+            {
+                GD.PushError($"Too many queued transitions ({MAX_QUEUED_TRANSITIONS})! Possible infinite loop?");
+                return;
+            }
+            pendingTransitions.Enqueue(id);
+            return;
+        }
+
         if (!states.TryGetValue(id, out State value))
         {
             GD.PushWarning($"Can not change state to {id} as it does not exist");
             return;
         }
 
-        bool canExit = !ignoreExit && currentState != null && !currentState.IsLocked();
-        if (canExit) currentState.Exit?.Invoke();
+        isTransitioning = true;
 
-        lastStateTime = stateTime;
-        stateTime = 0f;
+        try
+        {
+            bool canExit = !ignoreExit && currentState != null && !currentState.IsLocked();
+            if (canExit) currentState.Exit?.Invoke();
 
-        if (currentState != null)
-            previousId = currentState.Id;
+            lastStateTime = stateTime;
+            stateTime = 0f;
 
-        currentState = value;
-        currentState.Enter?.Invoke();
+            if (currentState != null)
+            {
+                previousId = currentState.Id;
+                hasPreviousState = true;
+            }
 
-        ReSortTransitions();
+            currentState = value;
+            currentState.Enter?.Invoke();
 
-        if (initialized)
-            StateChanged?.Invoke(previousId, currentState.Id);
+            ReSortTransitions();
+
+            if (initialized)
+                StateChanged?.Invoke(previousId, currentState.Id);
+        
+            while (pendingTransitions.Count > 0)
+            {
+                var nextId = pendingTransitions.Dequeue();
+                isTransitioning = false;
+                ChangeStateInternal(nextId);
+                isTransitioning = true;
+            }
+        }
+        finally
+        {
+            isTransitioning = false;
+        }
     }
 
     public Transition AddTransition(T from, T to)
@@ -252,6 +308,8 @@ public class StateMachine<T> where T : Enum
         
         if (removed == 0)
             GD.PushError($"No Transition Was Found Between: {from} -> {to}");
+        
+        ReSortTransitions();
         return removed > 0;
     }
 
@@ -265,22 +323,26 @@ public class StateMachine<T> where T : Enum
             return false;
         }
 
+        ReSortTransitions();
         return true;
     }
 
     public void ClearTransitionsFrom(T id)
     {
         transitions.Remove(id);
+        ReSortTransitions();
     }
 
     public void ClearTransitions()
     {
         transitions.Clear();
+        ReSortTransitions();
     }
 
     public void ClearGlobalTransitions()
     {
         globalTransitions.Clear();
+        ReSortTransitions();
     }
 
     private void ReSortTransitions()
@@ -288,7 +350,7 @@ public class StateMachine<T> where T : Enum
         transitionDirty = true;
     }
 
-    public void Process(SMProcessMode mode, double delta)
+    public void Process(FSMProcessMode mode, double delta)
     {
         if (paused || currentState == null) return;
 
@@ -302,6 +364,8 @@ public class StateMachine<T> where T : Enum
 
     private void CheckTransitions()
     {
+        if (currentState == null) return;
+
         bool timeoutTriggered = currentState.Timeout > 0f && stateTime >= currentState.Timeout;
 
         if (timeoutTriggered)
@@ -406,7 +470,7 @@ public class StateMachine<T> where T : Enum
     /// <summary>
     /// Gets how long the state machine was in the previous state before transitioning
     /// </summary>
-    public float GetPreviousStateTime() => lastStateTime;
+    public float GetPreviousStateTime() => hasPreviousState ? lastStateTime : -1f;
     public float GetStateTime() => stateTime;
     public float GetMinStateTime() => currentState?.MinTime ?? -1f;
     public float GetRemainingTime() => currentState?.Timeout > 0f ? Mathf.Max(0f, currentState.Timeout - stateTime) : -1f;
@@ -423,7 +487,7 @@ public class StateMachine<T> where T : Enum
 
     public T GetCurrentId() => currentState != null ? currentState.Id : default;
     public T GetInitialId() => initialized ? initialId : default;
-    public T GetPreviousId() => previousId;
+    public T GetPreviousId() => hasPreviousState ? previousId : throw new InvalidOperationException("No previous state");
 
     public bool HasTransition(T from, T to) => transitions.TryGetValue(from, out var list) && list.Any(t => t.To.Equals(to));
     public bool HasTransitionFrom(T from) => transitions.TryGetValue(from, out var list) && list.Count > 0;
@@ -431,11 +495,16 @@ public class StateMachine<T> where T : Enum
 
     public bool HasState(T id) => states.ContainsKey(id);
     public bool IsCurrentState(T id) => currentState?.Id.Equals(id) ?? false;
-    public bool IsPreviousState(T id) => Equals(previousId, id);
+    public bool IsPreviousState(T id) => hasPreviousState && Equals(previousId, id);
     public bool IsInStateWithTag(string tag) => currentState?.Tags.Contains(tag) ?? false;
 
-    public string DebugCurrentTransition() => 
-        currentState != null ? $"{previousId} -> {currentState.Id}" : "Not Started";
+    public string DebugCurrentTransition()
+    {
+        if (currentState == null) return "Not Started";
+        return hasPreviousState 
+            ? $"{previousId} -> {currentState.Id}" 
+            : $"[Initial] -> {currentState.Id}";
+    }
 
     public string DebugAllTransitions()
     {
@@ -470,8 +539,8 @@ public class StateMachine<T> where T : Enum
         public Action Enter { get; private set; }
         public Action Exit { get; private set; }
 
-        public SMProcessMode ProcessMode { get; private set; }
-        public SMLockMode LockMode { get; private set; }
+        public FSMProcessMode ProcessMode { get; private set; }
+        public FSMLockMode LockMode { get; private set; }
 
         private readonly HashSet<string> tags = new();
         private readonly Dictionary<string, object> data = new();
@@ -515,13 +584,13 @@ public class StateMachine<T> where T : Enum
             return this;
         }
 
-        public State SetProcessMode(SMProcessMode mode)
+        public State SetProcessMode(FSMProcessMode mode)
         {
             ProcessMode = mode;
             return this;
         }
 
-        public State Lock(SMLockMode mode = SMLockMode.Full)
+        public State Lock(FSMLockMode mode = FSMLockMode.Full)
         {
             LockMode = mode;
             return this;
@@ -529,7 +598,7 @@ public class StateMachine<T> where T : Enum
 
         public State UnLock()
         {
-            LockMode = SMLockMode.None;
+            LockMode = FSMLockMode.None;
             return this;
         }
 
@@ -567,9 +636,9 @@ public class StateMachine<T> where T : Enum
             return false;
         }
 
-        public bool IsLocked() => LockMode != SMLockMode.None;
-        public bool IsFullyLocked() => LockMode == SMLockMode.Full;
-        public bool TransitionBlocked() => LockMode == SMLockMode.Transition;
+        public bool IsLocked() => LockMode != FSMLockMode.None;
+        public bool IsFullyLocked() => LockMode == FSMLockMode.Full;
+        public bool TransitionBlocked() => LockMode == FSMLockMode.Transition;
 
         public bool HasTag(string tag) => tags.Contains(tag);
         public bool HasData(string id) => data.ContainsKey(id);
@@ -638,7 +707,7 @@ public class StateMachine<T> where T : Enum
         {
             From = from;
             To = to;
-            InsertionIndex = System.Threading.Interlocked.Increment(ref globalInsertionCounter);
+            InsertionIndex = globalInsertionCounter++;
         }
 
         internal static int Compare(Transition a, Transition b)
