@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.Linq;
+using System.Collections.Generic;
 
 namespace Godot.FSM;
 
@@ -473,7 +473,7 @@ public class StateMachine<T> where T : Enum
     public float GetPreviousStateTime() => hasPreviousState ? lastStateTime : -1f;
     public float GetStateTime() => stateTime;
     public float GetMinStateTime() => currentState?.MinTime ?? -1f;
-    public float GetRemainingTime() => currentState?.Timeout > 0f ? Mathf.Max(0f, currentState.Timeout - stateTime) : -1f;
+    public float GetRemainingTime() => currentState?.Timeout > 0f ? Math.Max(0f, currentState.Timeout - stateTime) : -1f;
 
     public State GetState(T id) => states.TryGetValue(id, out var result) ? result : null;
     public State GetStateWithTag(string tag) => states.Values.FirstOrDefault(state => state.Tags.Contains(tag));
@@ -482,7 +482,7 @@ public class StateMachine<T> where T : Enum
     {
         if (currentState == null || currentState.Timeout <= 0f)
             return -1f;
-        return Mathf.Clamp(stateTime / currentState.Timeout, 0f, 1f);
+        return Math.Clamp(stateTime / currentState.Timeout, 0f, 1f);
     }
 
     public T GetCurrentId() => currentState != null ? currentState.Id : default;
@@ -568,7 +568,7 @@ public class StateMachine<T> where T : Enum
 
         public State SetMinTime(float value)
         {
-            MinTime = Mathf.Max(0f, value);
+            MinTime = Math.Max(0f, value);
             return this;
         }
 
@@ -675,7 +675,7 @@ public class StateMachine<T> where T : Enum
 
         public Transition SetMinTime(float minTime)
         {
-            OverrideMinTime = Mathf.Max(0f, minTime);
+            OverrideMinTime = Math.Max(0f, minTime);
             return this;
         }
 
