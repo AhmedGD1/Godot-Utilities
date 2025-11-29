@@ -1,811 +1,652 @@
 using Godot;
 using System;
-using System.Linq;
 using System.Collections.Generic;
+using System.Linq;
 
-// NOTE: FSM is not thread-safe. Access only from main thread.
-
-/* =======================================================================
- *  ENUMS
- * ======================================================================= */
-public enum StateProcessType
+public enum SMProcessMode
 {
-   PhysicsProcess,
-   Process
+    Physics,
+    Idle
 }
 
-public enum StateLockType
+public enum SMLockMode
 {
-   None, // lock disabled;
-   Full, // Locks transitions & timeout Transitions;
-   Transition // Only Locks transitions;
+    None,
+    Full,
+    Transition
 }
 
-
-/* =======================================================================
- *  ANIMATION SYSTEM INTERFACES & IMPLEMENTATIONS
- * ======================================================================= */
-
-/// <summary>
-/// Interface for animation playback compatibility across different Godot node types
-/// </summary>
-public interface IAnimator
-{
-   void PlayAnimation(string name, float speed, float blend, bool loop, Action onFinished = null);
-}
-
-/// Extension methods
-public static class AnimatorExtensions
-{
-   public static IAnimator AsAnimator(this AnimationPlayer player) => new AnimationPlayerAdapter(player);
-   public static IAnimator AsAnimator(this AnimatedSprite2D sprite) => new AnimatedSprite2DAdapter(sprite);
-}
-
-/// Adapter for AnimationPlayer
-internal class AnimationPlayerAdapter : IAnimator
-{
-   private readonly AnimationPlayer player;
-   private readonly Dictionary<string, Action> finishCallbacks = new();
-
-   public AnimationPlayerAdapter(AnimationPlayer player)
-   {
-      this.player = player;
-      player.AnimationFinished += what => OnAnimationFinishedSignal(what);
-   }
-
-   public void PlayAnimation(string name, float speed, float blend, bool loop, Action onFinished = null)
-   {
-      if (player == null || string.IsNullOrEmpty(name)) return;
-      if (!player.HasAnimation(name))
-      {
-         GD.PushWarning($"Animation '{name}' not found in AnimationPlayer");
-         return;
-      }
-
-      var animation = player.GetAnimation(name);
-      if (animation != null)
-         animation.LoopMode = loop ? Animation.LoopModeEnum.Linear : Animation.LoopModeEnum.None;
-
-      if (onFinished != null) finishCallbacks[name] = onFinished;
-      player.Play(name, blend, speed);
-   }
-
-   private void OnAnimationFinishedSignal(string animName)
-   {
-      if (finishCallbacks.TryGetValue(animName, out var callback))
-      {
-         callback?.Invoke();
-         finishCallbacks.Remove(animName);
-      }
-   }
-}
-
-/// Adapter for AnimatedSprite2D
-internal class AnimatedSprite2DAdapter : IAnimator
-{
-   private readonly AnimatedSprite2D sprite;
-
-   public AnimatedSprite2DAdapter(AnimatedSprite2D sprite)
-   {
-      this.sprite = sprite;
-      sprite.AnimationFinished += () => OnAnimationFinishedSignal(sprite.Animation);
-   }
-
-   private Dictionary<string, Action> finishCallbacks = new();
-
-   public void PlayAnimation(string name, float speed, float blend, bool loop, Action onFinished = null)
-   {
-      if (sprite?.SpriteFrames == null || string.IsNullOrEmpty(name)) return;
-      if (!sprite.SpriteFrames.HasAnimation(name))
-      {
-         GD.PushWarning($"Animation '{name}' not found in AnimatedSprite2D");
-         return;
-      }
-
-      sprite.SpeedScale = speed;
-      sprite.Play(name);
-      sprite.SpriteFrames.SetAnimationLoop(name, loop);
-
-      if (onFinished != null) finishCallbacks[name] = onFinished;
-   }
-
-   private void OnAnimationFinishedSignal(string animName)
-   {
-      if (finishCallbacks.TryGetValue(animName, out var callback))
-      {
-         callback?.Invoke();
-         finishCallbacks.Remove(animName);
-      }
-   }
-}
-
-public struct AnimationConfig
-{
-   public string Name { get; private set; }
-   public float Speed { get; private set; }
-   public float CustomBlend { get; private set; }
-   public bool Loop { get; private set; }
-   public Action OnFinished { get; private set; }
-
-   public void PlayAnimation(IAnimator animator)
-   {
-      animator?.PlayAnimation(Name, Speed, CustomBlend, Loop, OnFinished);
-   }
-
-   public AnimationConfig(string name, float speed = 1f, float blend = 0f, bool loop = false, Action onFinished = null)
-   {
-      Name = name ?? "";
-      Speed = Mathf.Max(0.001f, speed);
-      CustomBlend = Mathf.Max(0f, blend);
-      Loop = loop;
-      OnFinished = onFinished;
-
-      if (speed == 0.001f)
-         GD.PushWarning("Animation speed is extremely low: 0.001f");
-   }
-}
-
-/* =======================================================================
-*  GENERIC STATE MACHINE
-* ======================================================================= */
-
-/// <summary>
-/// Generic finite state machine with support for animations, transitions, and data storage
-/// </summary>
-/// <typeparam name="T">Enum type for state identifiers</typeparam>
 public class StateMachine<T> where T : Enum
-{
-   /* --------------------------------------------------------
-   *  EVENTS
-   * -------------------------------------------------------- */
+    {
+    public event Action<T, T> StateChanged;
+    public event Action<T> TimeoutBlocked;
+    public event Action<T> StateTimeout;
+    public event Action<T, T> TransitionTriggered;
 
-   // Events fired on state/transition changes
-   public event Action<T, T> StateChanged;
-   public event Action<T, T> TransitionTriggered;
-   public event Action<T> TimeoutBlocked;
-   public event Action<T> StateTimeout;
+    private Dictionary<T, State> states = new();
+    private Dictionary<string, object> globalData = new();
 
-   /* --------------------------------------------------------
-   *  FIELDS
-   * -------------------------------------------------------- */
-   private Dictionary<T, State> states = new();
-   private Dictionary<T, List<Transition>> transitions = new();
-   private List<Transition> globalTransitions = new();
-   private Dictionary<string, object> globalData = new();
+    private Dictionary<T, List<Transition>> transitions = new();
+    private List<Transition> globalTransitions = new();
+    private List<Transition> cachedSortedTransitions = new();
 
-   private State currentState;
-   private T currentId;
-   private T previousId;
-   private T initialId;
+    private State currentState;
 
-   private bool hasInitialId;
-   private bool paused;
-   private float stateTime;
+    private T initialId;
+    private T previousId;
 
-   private IAnimator animator;
+    private bool initialized;
+    private bool paused;
+    private bool transitionDirty = true;
 
-   /* --------------------------------------------------------
-   *  STATE MANAGEMENT
-   * -------------------------------------------------------- */
-   public State AddState(T id, Action<double> update = null, Action enter = null, Action exit = null, float minTime = default, float timeout = -1, StateProcessType processType = StateProcessType.PhysicsProcess)
-   {
-      if (states.ContainsKey(id))
-      {
-         GD.PushError($"Trying to store an existent state: {id}");
-         return null;
-      }
 
-      State state = new State(id, update, enter, exit, minTime, timeout, processType);
-      states[id] = state;
+    private float stateTime;
+    private float lastStateTime;
+    
 
-      // First added state becomes the initial one
-      if (!hasInitialId)
-      {
-         initialId = id;
-         hasInitialId = true;
-      }
+    public State AddState(T id)
+    {
+        if (states.ContainsKey(id))
+        {
+            GD.PushError($"State with id: {id} already exists");
+            return null;
+        }
 
-      state.SetRestartId(initialId);
-      return state;
-   }
+        var state = new State(id);
+        states[id] = state;
 
-   public void Start()
-   {
-      if (hasInitialId)
-         ChangeStateInternal(initialId, true);
-   }
+        if (!initialized)
+        {
+            initialId = id;
+            initialized = true;
+        }
 
-   public void RemoveState(T id)
-   {
-      if (!states.ContainsKey(id))
-      {
-         GD.PushWarning("Trying to remove a non-existent state");
-         return;
-      }
+        state.SetRestart(id);
+        return state;
+    }
 
-      states.Remove(id);
+    public void Start()
+    {
+        if (initialized)
+            ChangeStateInternal(initialId, ignoreExit: true);
+    }
 
-      if (initialId.Equals(id))
-         hasInitialId = false;
+    public bool RemoveState(T id)
+    {
+        if (!states.ContainsKey(id))
+        {
+            GD.PushWarning($"State with id: {id} does not exist to be removed !");
+            return false;
+        }
 
-      if (currentId.Equals(id))
-         Reset();
+        states.Remove(id);
 
-      foreach (var key in transitions.Keys.ToList())
-         transitions[key] = transitions[key].Where(t => !t.To.Equals(id) && !t.From.Equals(id)).ToList();
+        if (initialId.Equals(id))
+            initialized = false;
+        
+        if (currentState?.Id.Equals(id) ?? false)
+            Reset();
 
-      globalTransitions = globalTransitions.Where(t => !t.To.Equals(id)).ToList();
-   }
+        transitions.Remove(id);
 
-   public bool Reset()
-   {
-      if (states.Count == 0)
-      {
-         GD.PushWarning("Trying to reset an empty state machine");
-         return false;
-      }
+        foreach (var kvp in transitions.ToList())
+        {
+            kvp.Value.RemoveAll(t => t.To.Equals(id));
 
-      if (!hasInitialId)
-         SetInitialId(states.Values.First().Id);
+            if (kvp.Value.Count == 0)
+                transitions.Remove(kvp.Key);
+        }
 
-      ChangeStateInternal(initialId);
-      previousId = default;
-      return true;
-   }
+        globalTransitions.RemoveAll(t => t.To.Equals(id));
+        return true;
+    }
 
-   public void SetInitialId(T id)
-   {
-      if (!states.ContainsKey(id))
-      {
-         GD.PushError($"Trying to set non-existent state as initial: {id}");
-         return;
-      }
+    public bool Reset()
+    {
+        if (states.Count == 0)
+        {
+            GD.PushWarning("State Machine can Reset while being Empty !");
+            return false;
+        }
 
-      initialId = id;
-      hasInitialId = true;
-   }
+        if (!initialized)
+            SetInitialId(states.Values.First().Id);
+        ChangeStateInternal(initialId);
+        previousId = default;
+        return true;
+    }
 
-   public void RestartCurrentState(bool ignoreExit = false, bool ignoreEnter = false)
-   {
-      if (currentState == null)
-      {
-         GD.PushWarning("Trying to restart a non-existent state");
-         return;
-      }
-
-      ResetStateTime();
-
-      if (!ignoreExit && !currentState.IsLocked()) currentState.Exit?.Invoke();
-      if (!ignoreEnter) currentState.Enter?.Invoke();
-   }
-
-   public State GetState(T id)
-   {
-      states.TryGetValue(id, out var state);
-      return state;
-   }
-
-   /* --------------------------------------------------------
-   *  STATE CHANGING
-   * -------------------------------------------------------- */
-   public bool TryChangeState(T id, bool condition = true)
-   {
-      if (!condition) return false;
-
-      ChangeStateInternal(id);
-      return true;
-   }
-
-   public bool ForceChangeState(T id)
-   {
-      if (!states.ContainsKey(id) || (currentState?.IsLocked() ?? false))
-         return false;
-
-      ChangeStateInternal(id);
-      return true;
-   }
-
-   public void GoBack()
-   {
-      if (!states.ContainsKey(previousId) || (currentState?.IsLocked() ?? false))
-      {
-         GD.PushError($"There is no previous state to go back to or current state is locked. Current State Id: {currentId}");
-         return;
-      }
-
-      ChangeStateInternal(previousId);
-   }
-
-   public bool GoBackIfPossible()
-   {
-      if (!states.ContainsKey(previousId) || (currentState?.IsLocked() ?? false))
-         return false;
-
-      ChangeStateInternal(previousId);
-      return true;
-   }
-
-   private void ChangeStateInternal(T id, bool ignoreExit = false)
-   {
-      if (!states.ContainsKey(id))
-      {
-         GD.PushWarning("Trying to switch to a non-existent state");
-         return;
-      }
-
-      bool canExit = !ignoreExit && currentState != null && !currentState.IsLocked();
-      if (canExit) currentState.Exit?.Invoke();
-
-      // Switch state
-      stateTime = 0f;
-      previousId = currentId;
-      currentId = id;
-      currentState = states[id];
-
-      currentState.Enter?.Invoke();
-
-      // Play animation if defined
-      if (currentState.Data.ContainsKey("Animation"))
-      {
-         var config = currentState.GetData<AnimationConfig>("Animation");
-         config.PlayAnimation(animator);
-      }
-
-      if (hasInitialId)
-         StateChanged?.Invoke(previousId, currentId);
-   }
-
-   /* --------------------------------------------------------
-   *  TRANSITION MANAGEMENT
-   * -------------------------------------------------------- */
-   public Transition AddTransition(T fromId, T toId, Predicate<StateMachine<T>> condition, float overrideMinTime = default)
-   {
-      if (!states.ContainsKey(toId))
-      {
-         GD.PushError("Trying to add a transition to a non-existent state");
-         return null;
-      }
-
-      if (!transitions.ContainsKey(fromId))
-         transitions[fromId] = new();
-
-      Transition transition = new Transition(fromId, toId, condition, overrideMinTime);
-      transitions[fromId].Add(transition);
-
-      return transition;
-   }
-
-   public void AddTransition(T[] from, T to, Predicate<StateMachine<T>> condition, float[] overrideMinTime = default)
-   {
-      for (int i = 0; i < from.Length; i++)
-      {
-         T t = from[i];
-         float minTime = -1;
-
-         if (overrideMinTime != null && overrideMinTime.Length > i)
-            minTime = overrideMinTime[i];
-
-         AddTransition(t, to, condition, minTime);
-      }
-   }
-
-   public Transition AddGlobalTransition(T toId, Predicate<StateMachine<T>> condition, float overrideMinTime = default)
-   {
-      if (!states.ContainsKey(toId))
-      {
-         GD.PushError("Trying to add a global transition to a non-existent state");
-         return null;
-      }
-
-      Transition transition = new Transition(default, toId, condition, overrideMinTime);
-      globalTransitions.Add(transition);
-
-      return transition;
-   }
-
-   public bool RemoveTransition(T from, T to)
-   {
-      if (!transitions.ContainsKey(from))
-      {
-         GD.PushWarning("Trying to remove a non-existent transition");
-         return false;
-      }
-
-      int originalCount = transitions[from].Count;
-      transitions[from] = transitions[from].Where(t => !t.To.Equals(to)).ToList();
-
-      if (transitions[from].Count == 0)
-         transitions.Remove(from);
-
-      bool removed = transitions.ContainsKey(from) ? transitions[from].Count < originalCount : originalCount > 0;
-      if (!removed) GD.PushError($"No Transition Was Found Between: {from} -> {to}");
-
-      return removed;
-   }
-
-   public bool RemoveGlobalTransition(T to)
-   {
-      if (!HasAnyGlobalTransition(to))
-      {
-         GD.PushWarning("Trying to remove a non-existent global transition");
-         return false;
-      }
-
-      int originalCount = globalTransitions.Count;
-      globalTransitions = globalTransitions.Where(t => !t.To.Equals(to)).ToList();
-
-      bool removed = globalTransitions.Count < originalCount;
-      if (!removed) GD.PushError($"No Global Transition Was Found Between: {currentId} -> {to}");
-      return removed;
-   }
-
-   public void CleanTransitionsFromState(T from) => transitions.Remove(from);
-   public void CleanTransitions() => transitions.Clear();
-   public void CleanGlobalTransitions() => globalTransitions.Clear();
-
-   /* --------------------------------------------------------
-   *  PROCESSING (UPDATE LOOP)
-   * -------------------------------------------------------- */
-   public void Process(StateProcessType processType, double delta)
-   {
-      if (paused || currentState == null) return;
-
-      if (currentState.processType == processType)
-      {
-         stateTime += (float)delta;
-         currentState.Update?.Invoke(delta);
-         CheckTransitions();
-      }
-   }
-
-   private void CheckTransitions()
-   {
-      // Timeout transition
-      bool timeoutTriggered = currentState.Timeout > 0f && stateTime >= currentState.Timeout;
-
-      if (timeoutTriggered)
-      {
-         if (currentState.IsFullyLocked())
-         {
-            TimeoutBlocked?.Invoke(currentId);
+    public void SetInitialId(T id)
+    {
+        if (!states.ContainsKey(id))
+        {
+            GD.PushError($"State with this id does not exist");
             return;
-         }
+        }
 
-         StateTimeout?.Invoke(currentId);
-         var restartId = currentState.RestartId;
-         ChangeStateInternal(restartId);
-         TransitionTriggered?.Invoke(currentId, restartId);
-         return;
-      }
+        initialId = id;
+        initialized = true;
+    }
 
-      if (currentState.TransitionBlocked()) return;
-
-      var evaluator = TransitionPool.Get();
-
-      try
-      {
-         if (transitions.TryGetValue(currentId, out var currentTransitions))
-            evaluator.CandidateTransitions.AddRange(currentTransitions);
-
-         evaluator.CandidateTransitions.AddRange(globalTransitions);
-
-         // Sort transitions by priority
-         if (evaluator.HasCandidates())
-         {
-            evaluator.CandidateTransitions.Sort(Transition.Compare);
-            CheckTransitionsLoop(evaluator.CandidateTransitions);
-         }
-      }
-      finally
-      {
-         TransitionPool.Return(evaluator);
-      }
-   }
-
-   private void CheckTransitionsLoop(List<Transition> candidateTransitions)
-   {
-      foreach (Transition transition in candidateTransitions)
-      {
-         float requiredTime = transition.OverrideMinTime > 0 ? transition.OverrideMinTime : currentState.MinTime;
-         bool timeRequirementMet = transition.ForceInstantTransition || stateTime >= requiredTime;
-
-         if (timeRequirementMet && (transition.Condition?.Invoke(this) ?? true))
-         {
-            ChangeStateInternal(transition.To);
-            TransitionTriggered?.Invoke(transition.From, transition.To);
-            transition.OnTriggered?.Invoke();
+    public void RestartCurrentState(bool ignoreExit = false, bool ignoreEnter = false)
+    {
+        if (currentState == null)
+        {
+            GD.PushWarning("Can't restart current state as it does not exist");
             return;
-         }
-      }
-   }
+        }
 
-   /* --------------------------------------------------------
-   *  PAUSE / RESUME
-   * -------------------------------------------------------- */
-   public void Pause() => paused = true;
-   public bool IsPaused() => paused;
+        ResetStateTime();
 
-   public void Resume(bool resetTime = false)
-   {
-      paused = false;
-      if (resetTime) ResetStateTime();
-   }
+        if (!ignoreExit && !currentState.IsLocked()) currentState.Exit?.Invoke();
+        if (!ignoreEnter) currentState.Enter?.Invoke();
+    }
 
-   public void ResetStateTime() => stateTime = 0f;
+    public void ResetStateTime()
+    {
+        lastStateTime = stateTime;
+        stateTime = 0f;
+    }
 
-   /* --------------------------------------------------------
-   *  GETTERS / DEBUG
-   * -------------------------------------------------------- */
-   public void SetAnimator(IAnimator what) => animator = what;
+    public bool TryChangeState(T id, Func<bool> condition = null)
+    {
+        if (!(condition?.Invoke() ?? true))
+            return false;
 
-   public bool SetGlobalData(string key, object value)
-   {
-      if (string.IsNullOrEmpty(key)) return false;
-      globalData[key] = value;
-      return true;
-   }
+        if (!states.ContainsKey(id))
+            return false;
 
-   public void RemoveGlobalData(string key) => globalData.Remove(key);
+        ChangeStateInternal(id);
+        return true;
+    }
 
-   public TData GetGlobalData<TData>(string key) =>
-      globalData.TryGetValue(key, out var value) && value is TData castResult ? castResult : default;
+    public bool TryGoBack()
+    {
+        if (!states.ContainsKey(previousId) || (currentState?.IsLocked() ?? false))
+        {
+            GD.PushError("Can't go back to previous state as it could be null or locked");
+            return false;
+        }
 
-   public T GetCurrentStateId() => currentState != null ? currentState.Id : default;
-   public T GetInitialStateId() => initialId;
-   public float GetStateTime() => stateTime;
-   public float GetMinStateTime() => currentState?.MinTime ?? 0;
+        ChangeStateInternal(previousId);
+        return true;
+    }
 
-   public float GetRemainingTime() =>
-      currentState?.Timeout > 0 ? Mathf.Max(0, currentState.Timeout - stateTime) : -1;
+    private void ChangeStateInternal(T id, bool ignoreExit = false)
+    {
+        if (!states.TryGetValue(id, out State value))
+        {
+            GD.PushWarning($"Can not change state to {id} as it does not exist");
+            return;
+        }
 
-   public bool HasTransition(T from, T to) =>
-      transitions.ContainsKey(from) && transitions[from].Any(t => t.To.Equals(to));
+        bool canExit = !ignoreExit && currentState != null && !currentState.IsLocked();
+        if (canExit) currentState.Exit?.Invoke();
 
-   public bool HasAnyTransitionFrom(T id) =>
-      transitions.ContainsKey(id) && transitions[id].Count > 0;
+        lastStateTime = stateTime;
+        stateTime = 0f;
 
-   public bool HasAnyGlobalTransition(T to) =>
-      globalTransitions.Any(t => t.To.Equals(to));
+        if (currentState != null)
+            previousId = currentState.Id;
 
-   public bool HasPreviousState() => !EqualityComparer<T>.Default.Equals(previousId, default);
-   public bool HasStateId(T id) => states.ContainsKey(id);
+        currentState = value;
+        currentState.Enter?.Invoke();
 
-   public bool IsCurrentState(T id) => currentState?.Id.Equals(id) ?? false;
-   public bool IsPreviousState(T id) => Equals(previousId, id);
-   public bool IsInStateWithTag(string tag) => currentState?.Tags.Contains(tag) ?? false;
+        ReSortTransitions();
 
-   public T GetPreviousStateId() => previousId;
+        if (initialized)
+            StateChanged?.Invoke(previousId, currentState.Id);
+    }
 
-   public string DebugCurrentTransition() => $"{previousId} -> {currentId}";
+    public Transition AddTransition(T from, T to)
+    {
+        if (!states.ContainsKey(to))
+        {
+            GD.PushError($"Can not transition as (To state) does not exist");
+            return null;
+        }
 
-   public string DebugAllTransitions()
-   {
-      var result = new List<string>();
-      foreach (var kvp in transitions)
-         foreach (var t in kvp.Value)
-            result.Add($"{t.From} -> {t.To} (Priority: {t.Priority})");
+        if (!transitions.ContainsKey(from))
+            transitions[from] = new();
+        
+        Transition transition = new Transition(from, to);
+        transitions[from].Add(transition);
 
-      foreach (var t in globalTransitions)
-         result.Add($"GLOBAL -> {t.To} (Priority: {t.Priority})");
+        ReSortTransitions();
+        return transition;
+    }
 
-      return string.Join("\n", result);
-   }
+    public void AddTransitions(T[] from, T to, Predicate<StateMachine<T>> condition)
+    {
+        for (int i = 0; i < from.Length; i++)
+            AddTransition(from[i], to).SetCondition(condition);
+    }
 
-   public string DebugAllStates()
-   {
-      var result = new List<string>();
-      foreach (State state in states.Values)
-         result.Add(state.Id.ToString());
-      return string.Join("\n", result);
-   }
+    public Transition AddGlobalTransition(T to)
+    {
+        if (!states.ContainsKey(to))
+        {
+            GD.PushError($"Can not transition as (To state) does not exist");
+            return null;
+        }
 
-   /* --------------------------------------------------------
-   *  NESTED CLASSES
-   * -------------------------------------------------------- */
+        Transition transition = new Transition(default, to);
+        globalTransitions.Add(transition);
 
-   /// <summary>
-   /// Represents a single state in the state machine
-   /// </summary>
-   public class State
-   {
-      public T Id { get; private set; }
-      public T RestartId { get; private set; }
-      public float MinTime { get; private set; }
-      public float Timeout { get; private set; }
-      public Action<double> Update { get; private set; }
-      public Action Enter { get; private set; }
-      public Action Exit { get; private set; }
-      public StateProcessType processType { get; private set; }
-      public StateLockType LockType { get; private set; }
+        ReSortTransitions();
+        return transition;
+    }
 
-      private HashSet<string> tags = new();
-      private Dictionary<string, object> data = new();
+    public bool RemoveTransition(T from, T to)
+    {
+        if (!transitions.TryGetValue(from, out List<Transition> value))
+        {
+            GD.PushWarning("The (from transition) does not exist");
+            return false;
+        }
 
-      public IReadOnlyCollection<string> Tags => tags;
-      public IReadOnlyDictionary<string, object> Data => data;
+        int removed = value.RemoveAll(t => t.To.Equals(to));
 
-      public State Lock(StateLockType type = StateLockType.Transition)
-      {
-         LockType = type;
-         return this;
-      }
+        if (value.Count == 0)
+            transitions.Remove(from);
+        
+        if (removed == 0)
+            GD.PushError($"No Transition Was Found Between: {from} -> {to}");
+        return removed > 0;
+    }
 
-      public State Unlock()
-      {
-         LockType = StateLockType.None;
-         return this;
-      }
+    public bool RemoveGlobalTransition(T to)
+    {
+        int removed = globalTransitions.RemoveAll(t => t.To.Equals(to));
 
-      public State SetRestartId(T value)
-      {
-         RestartId = value;
-         return this;
-      }
+        if (removed == 0)
+        {
+            GD.PushWarning($"No Global Transition Was Found to state: {to}");
+            return false;
+        }
 
-      public State SetProcessType(StateProcessType type)
-      {
-         processType = type;
-         return this;
-      }
+        return true;
+    }
 
-      public bool IsLocked() => LockType != StateLockType.None;
-      public bool IsFullyLocked() => LockType == StateLockType.Full;
-      public bool TransitionBlocked() => LockType == StateLockType.Transition;
+    public void ClearTransitionsFrom(T id)
+    {
+        transitions.Remove(id);
+    }
 
-      public bool HasTag(string tag) => Tags.Contains(tag);
-      public bool HasData(string key) => Data.ContainsKey(key);
-      public IEnumerable<string> GetTags() => Tags;
+    public void ClearTransitions()
+    {
+        transitions.Clear();
+    }
 
-      public State SetAnimationData(string animationName, float speed = 1f, float blendTime = -1f, bool loop = false, Action onFinished = null)
-      {
-         AnimationConfig config = new AnimationConfig(animationName, speed, blendTime, loop, onFinished);
-         SetData("Animation", config);
-         return this;
-      }
+    public void ClearGlobalTransitions()
+    {
+        globalTransitions.Clear();
+    }
 
-      public State AddTags(params string[] what)
-      {
-         foreach (var tag in what)
-            tags.Add(tag);
-         return this;
-      }
+    private void ReSortTransitions()
+    {
+        transitionDirty = true;
+    }
 
-      public State SetData(string key, object value)
-      {
-         if (!string.IsNullOrEmpty(key))
-            data[key] = value;
-         return this;
-      }
+    public void Process(SMProcessMode mode, double delta)
+    {
+        if (paused || currentState == null) return;
 
-      public State RemoveData(string key)
-      {
-         data.Remove(key);
-         return this;
-      }
+        if (currentState.ProcessMode == mode)
+        {
+            stateTime += (float)delta;
+            currentState.Update?.Invoke(delta);
+            CheckTransitions();
+        }
+    }
 
-      public bool TryGetData<TData>(string key, out TData result)
-      {
-         if (data.TryGetValue(key, out var value) && value is TData castValue)
-         {
-            result = castValue;
+    private void CheckTransitions()
+    {
+        bool timeoutTriggered = currentState.Timeout > 0f && stateTime >= currentState.Timeout;
+
+        if (timeoutTriggered)
+        {
+            if (currentState.IsFullyLocked())
+            {
+                TimeoutBlocked?.Invoke(currentState.Id);
+                return;
+            }
+
+            var restartId = currentState.RestartId;
+            var fromId = currentState.Id;
+
+            if (!states.ContainsKey(restartId))
+            {
+                GD.PushError($"RestartId {restartId} doesn't exist for state {fromId}");
+                return;
+            }
+
+            StateTimeout?.Invoke(fromId);
+            ChangeStateInternal(restartId);
+            TransitionTriggered?.Invoke(fromId, restartId);
+            return;
+        }
+
+        if (currentState.TransitionBlocked()) return;
+
+        RebuildTransitionCache();
+
+        if (cachedSortedTransitions.Count > 0)
+            CheckTransitionLoop(cachedSortedTransitions);
+    }
+
+    private void CheckTransitionLoop(List<Transition> candidateTransitions)
+    {
+        foreach (Transition transition in candidateTransitions)
+        {
+            float requiredTime = transition.OverrideMinTime > 0f ? transition.OverrideMinTime : currentState.MinTime;
+            bool timeRequirementMet = stateTime > requiredTime || transition.ForceInstantTransition;
+
+            if (timeRequirementMet && (transition.Condition?.Invoke(this) ?? true))
+            {
+                ChangeStateInternal(transition.To);
+                transition.Triggered?.Invoke();
+                TransitionTriggered?.Invoke(transition.From, transition.To);
+                return;
+            }
+        }
+    }
+
+    private void RebuildTransitionCache()
+    {
+        if (!transitionDirty) return;
+
+        cachedSortedTransitions.Clear();
+
+        if (currentState != null && transitions.TryGetValue(currentState.Id, out var currentTransitions))
+            cachedSortedTransitions.AddRange(currentTransitions);
+        
+        cachedSortedTransitions.AddRange(globalTransitions);
+        cachedSortedTransitions.Sort(Transition.Compare);
+
+        transitionDirty = false;
+    }
+
+    public bool SetData(string id, object data)
+    {
+        if (string.IsNullOrEmpty(id)) 
+            return false;
+        globalData[id] = data;
+        return true;
+    }
+
+    public bool RemoveGlobalData(string id)
+    {
+        if (!globalData.ContainsKey(id))
+            return false;
+        globalData.Remove(id);
+        return true;
+    }
+
+    public bool TryGetData<TData>(string id, out TData data)
+    {
+        if (globalData.TryGetValue(id, out var value) && value is TData castValue)
+        {
+            data = castValue;
             return true;
-         }
+        }
+        data = default;
+        return false;
+    }
 
-         result = default;
-         return false;
-      }
+    public bool IsActive() => !paused;
+    public void Pause() => paused = true;
+    public void Resume(bool resetTime = false)
+    {   
+        if (resetTime)
+            ResetStateTime();
+        paused = false;
+    }
 
-      public TData GetData<TData>(string key, TData defaultValue = default)
-      {
-         return TryGetData<TData>(key, out var result) ? result : defaultValue;
-      }
+    /// <summary>
+    /// Gets how long the state machine was in the previous state before transitioning
+    /// </summary>
+    public float GetPreviousStateTime() => lastStateTime;
+    public float GetStateTime() => stateTime;
+    public float GetMinStateTime() => currentState?.MinTime ?? -1f;
+    public float GetRemainingTime() => currentState?.Timeout > 0f ? Mathf.Max(0f, currentState.Timeout - stateTime) : -1f;
 
-      public State(T id, Action<double> update, Action enter, Action exit, float minTime, float timeout, StateProcessType type = default)
-      {
-         Id = id;
-         Update = update;
-         Enter = enter;
-         Exit = exit;
-         MinTime = Mathf.Max(0, minTime);
-         Timeout = timeout;
-         processType = type;
-         RestartId = id;
-      }
-   }
+    public State GetState(T id) => states.TryGetValue(id, out var result) ? result : null;
+    public State GetStateWithTag(string tag) => states.Values.FirstOrDefault(state => state.Tags.Contains(tag));
 
-   /// <summary>
-   /// Represents a transition between states
-   /// </summary>
-   public class Transition
-   {
-      public T From { get; private set; }
-      public T To { get; private set; }
-      public float OverrideMinTime { get; private set; }
-      public Predicate<StateMachine<T>> Condition { get; private set; }
-      public bool ForceInstantTransition { get; private set; }
-      public int Priority { get; private set; }
-      public int InsertionIndex { get; private set; }
+    public float GetTimeoutProgress()
+    {
+        if (currentState == null || currentState.Timeout <= 0f)
+            return -1f;
+        return Mathf.Clamp(stateTime / currentState.Timeout, 0f, 1f);
+    }
 
-      public Action OnTriggered { get; private set; }
+    public T GetCurrentId() => currentState != null ? currentState.Id : default;
+    public T GetInitialId() => initialized ? initialId : default;
+    public T GetPreviousId() => previousId;
 
-      public Transition ForceInstant()
-      {
-         ForceInstantTransition = true;
-         return this;
-      }
+    public bool HasTransition(T from, T to) => transitions.TryGetValue(from, out var list) && list.Any(t => t.To.Equals(to));
+    public bool HasTransitionFrom(T from) => transitions.TryGetValue(from, out var list) && list.Count > 0;
+    public bool HasGlobalTransition(T id) => globalTransitions.Any(t => t.To.Equals(id));
 
-      public Transition SetPriority(int value)
-      {
-         Priority = Math.Max(0, value);
-         return this;
-      }
+    public bool HasState(T id) => states.ContainsKey(id);
+    public bool IsCurrentState(T id) => currentState?.Id.Equals(id) ?? false;
+    public bool IsPreviousState(T id) => Equals(previousId, id);
+    public bool IsInStateWithTag(string tag) => currentState?.Tags.Contains(tag) ?? false;
 
-      public Transition SetHeighestPriority()
-      {
-         Priority = int.MaxValue;
-         return this;
-      }
+    public string DebugCurrentTransition() => 
+        currentState != null ? $"{previousId} -> {currentState.Id}" : "Not Started";
 
-      public Transition SetCondition(Predicate<StateMachine<T>> condition)
-      {
-         Condition = condition;
-         return this;
-      }
+    public string DebugAllTransitions()
+    {
+        var result = new List<string>();
+        foreach (var kvp in transitions)
+            foreach (var t in kvp.Value)
+                result.Add($"{t.From} -> {t.To} (Priority: {t.Priority})");
 
-      public Transition SetMinTime(float time)
-      {
-         OverrideMinTime = time;
-         return this;
-      }
+        foreach (var t in globalTransitions)
+            result.Add($"GLOBAL -> {t.To} (Priority: {t.Priority})");
 
-      public Transition(T from, T to, Predicate<StateMachine<T>> condition, float minTime = -1)
-      {
-         From = from;
-         To = to;
-         Condition = condition;
-         OverrideMinTime = minTime;
-         InsertionIndex = TransitionPool.GetNextIndex();
-      }
+        return string.Join("\n", result);
+    }
 
-      internal static int Compare(Transition a, Transition b)
-      {
-         int priorityCompare = b.Priority.CompareTo(a.Priority);
-         return priorityCompare != 0 ? priorityCompare : a.InsertionIndex.CompareTo(b.InsertionIndex);
-      }
-   }
+    public string DebugAllStates()
+    {
+        var result = new List<string>();
+        foreach (State state in states.Values)
+            result.Add(state.Id.ToString());
+        return string.Join("\n", result);
+    }
 
-   /// <summary>
-   /// Object pool for transition evaluators to reduce garbage collection
-   /// </summary>
-   public static class TransitionPool
-   {
-      private static Queue<TransitionEvaluator> pool = new();
-      private static int nextIndex = 0;
+    public class State(T id)
+    {
+        public T Id { get; private set; } = id;
+        public T RestartId { get; private set; }
 
-      public static TransitionEvaluator Get()
-      {
-         return pool.Count > 0 ? pool.Dequeue() : new TransitionEvaluator();
-      }
+        public float MinTime { get; private set; }
+        public float Timeout { get; private set; } = -1f;
 
-      public static void Return(TransitionEvaluator evaluator)
-      {
-         if (evaluator == null) return;
+        public Action<double> Update { get; private set; }
+        public Action Enter { get; private set; }
+        public Action Exit { get; private set; }
 
-         evaluator.Reset();
-         pool.Enqueue(evaluator);
-      }
+        public SMProcessMode ProcessMode { get; private set; }
+        public SMLockMode LockMode { get; private set; }
 
-      public static int GetNextIndex() => nextIndex++;
-   }
+        private readonly HashSet<string> tags = new();
+        private readonly Dictionary<string, object> data = new();
 
-   /// <summary>
-   /// Helper class for evaluating transitions
-   /// </summary>
-   public class TransitionEvaluator
-   {
-      public List<Transition> CandidateTransitions { get; private set; } = new();
+        public IReadOnlyCollection<string> Tags => tags;
+        public IReadOnlyDictionary<string, object> Data => data;
 
-      public void Reset() => CandidateTransitions.Clear();
-      public bool HasCandidates() => CandidateTransitions.Count > 0;
-   }
+        public State OnUpdate(Action<double> update)
+        {
+            Update = update;
+            return this;
+        }
+
+        public State OnEnter(Action enter)
+        {
+            Enter = enter;
+            return this;
+        }
+
+        public State OnExit(Action exit)
+        {
+            Exit = exit;
+            return this;
+        }
+
+        public State SetMinTime(float value)
+        {
+            MinTime = Mathf.Max(0f, value);
+            return this;
+        }
+
+        public State SetTimeout(float value)
+        {
+            Timeout = value;
+            return this;
+        }
+
+        public State SetRestart(T id)
+        {
+            RestartId = id;
+            return this;
+        }
+
+        public State SetProcessMode(SMProcessMode mode)
+        {
+            ProcessMode = mode;
+            return this;
+        }
+
+        public State Lock(SMLockMode mode = SMLockMode.Full)
+        {
+            LockMode = mode;
+            return this;
+        }
+
+        public State UnLock()
+        {
+            LockMode = SMLockMode.None;
+            return this;
+        }
+
+        public State AddTags(params string[] what)
+        {
+            foreach (string tag in what)
+                tags.Add(tag);
+            return this;
+        }
+
+        public State RegisterData(string id, object value)
+        {
+            if (data.ContainsKey(id))
+            {
+                GD.PushError($"Trying to add an existing data with Id: {id}");
+                return this;
+            }
+            data[id] = value;
+            return this;
+        }
+
+        public bool RemoveData(string id)
+        {
+            return data.Remove(id);
+        }
+
+        public bool TryGetData<TData>(string id, out TData value)
+        {
+            if (data.TryGetValue(id, out var obj) && obj is TData typed)
+            {
+                value = typed;
+                return true;
+            }
+            value = default;
+            return false;
+        }
+
+        public bool IsLocked() => LockMode != SMLockMode.None;
+        public bool IsFullyLocked() => LockMode == SMLockMode.Full;
+        public bool TransitionBlocked() => LockMode == SMLockMode.Transition;
+
+        public bool HasTag(string tag) => tags.Contains(tag);
+        public bool HasData(string id) => data.ContainsKey(id);
+        public bool HasData(object value) => data.ContainsValue(value);
+    }
+
+    public class Transition
+    {
+        private static int globalInsertionCounter = 0;
+
+        public T From { get; private set; }
+        public T To { get; private set; }
+        public Predicate<StateMachine<T>> Condition { get; private set; }
+
+        public float OverrideMinTime { get; private set; } = -1f;
+        public int Priority { get; private set; }
+        public int InsertionIndex { get; private set; }
+
+        public bool ForceInstantTransition { get; private set; }
+
+        public Action Triggered { get; private set; }
+
+        public Transition OnTriggered(Action callback)
+        {
+            Triggered = callback;
+            return this;
+        }
+
+        public Transition SetCondition(Predicate<StateMachine<T>> condition)
+        {
+            Condition = condition;
+            return this;   
+        }
+
+        public Transition SetMinTime(float minTime)
+        {
+            OverrideMinTime = Mathf.Max(0f, minTime);
+            return this;
+        }
+
+        public Transition SetPriority(int priority)
+        {
+            Priority = priority;
+            return this;
+        }
+
+        public Transition SetOnTop()
+        {
+            Priority = int.MaxValue;
+            return this;
+        }
+
+        public Transition ForceInstant()
+        {
+            ForceInstantTransition = true;
+            return this;
+        }
+
+        public Transition BreakInstant()
+        {
+            ForceInstantTransition = false;
+            return this;
+        }
+
+        public Transition(T from, T to)
+        {
+            From = from;
+            To = to;
+            InsertionIndex = System.Threading.Interlocked.Increment(ref globalInsertionCounter);
+        }
+
+        internal static int Compare(Transition a, Transition b)
+        {
+            int priorityCompare = b.Priority.CompareTo(a.Priority);
+            return priorityCompare != 0 ? priorityCompare : a.InsertionIndex.CompareTo(b.InsertionIndex);
+        }
+    }
+
+
 }
