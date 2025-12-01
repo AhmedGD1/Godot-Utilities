@@ -4,6 +4,26 @@ using System.Collections.Generic;
 
 namespace Godot.FSM;
 
+
+/// <summary>
+/// Logger to tag errors (consider using an adaper to make it actually work)
+/// </summary>
+public interface ILogger
+{
+    void LogError(string text);
+    void LogWarning(string text);
+}
+
+/*
+public class GodotLogger : ILogger
+{
+    public void LogError(string text) => GD.PushError(text);
+    public void LogWarning(string text) => GD.PushWarning(text);
+}
+
+later: logger = new GodotLogger();
+*/
+
 public enum FSMProcessMode
 {
     Physics,
@@ -21,6 +41,7 @@ public enum FSMLockMode
 public class StateMachine<T> where T : Enum
 {
     private const int MAX_QUEUED_TRANSITIONS = 20;
+    private const string TRANSITION_PER_DATA = "__transition_data__";
 
     public event Action<T, T> StateChanged;
     public event Action<T> TimeoutBlocked;
@@ -53,11 +74,18 @@ public class StateMachine<T> where T : Enum
     private float stateTime;
     private float lastStateTime;
 
+    private ILogger logger;
+
+    public StateMachine(ILogger logger)
+    {
+        this.logger = logger;
+    }
+
     public State AddState(T id)
     {
         if (states.ContainsKey(id))
         {
-            GD.PushError($"State with id: {id} already exists");
+            logger.LogError($"State with id: {id} already exists");
             return null;
         }
 
@@ -84,7 +112,7 @@ public class StateMachine<T> where T : Enum
     {
         if (!states.ContainsKey(id))
         {
-            GD.PushWarning($"State with id: {id} does not exist to be removed !");
+            logger.LogWarning($"State with id: {id} does not exist to be removed !");
             return false;
         }
 
@@ -120,13 +148,13 @@ public class StateMachine<T> where T : Enum
     {
         if (states.Count == 0)
         {
-            GD.PushWarning("State Machine can Reset while being Empty !");
+            logger.LogWarning("State Machine can Reset while being Empty !");
             return false;
         }
 
         if (!initialized)
         {
-            GD.PushWarning("State Machine not initialized - call SetInitialId() first");
+            logger.LogWarning("State Machine not initialized - call SetInitialId() first");
             return false;
         }
 
@@ -140,7 +168,7 @@ public class StateMachine<T> where T : Enum
     {
         if (!states.ContainsKey(id))
         {
-            GD.PushError($"State with this id does not exist");
+            logger.LogError($"State with this id does not exist");
             return;
         }
 
@@ -152,7 +180,7 @@ public class StateMachine<T> where T : Enum
     {
         if (currentState == null)
         {
-            GD.PushWarning("Can't restart current state as it does not exist");
+            logger.LogWarning("Can't restart current state as it does not exist");
             return;
         }
 
@@ -178,7 +206,7 @@ public class StateMachine<T> where T : Enum
 
        
         if (data != null)
-            SetData("__transition_data__", data);
+            SetData(TRANSITION_PER_DATA, data);
         ChangeStateInternal(id);
         return true;
     }
@@ -187,7 +215,7 @@ public class StateMachine<T> where T : Enum
     {
         if (!hasPreviousState || !states.ContainsKey(previousId) || (currentState?.IsLocked() ?? false))
         {
-            GD.PushError("Can't go back to previous state");
+            logger.LogError("Can't go back to previous state");
             return false;
         }
 
@@ -201,7 +229,7 @@ public class StateMachine<T> where T : Enum
         {
             if (pendingTransitions.Count >= MAX_QUEUED_TRANSITIONS)
             {
-                GD.PushError($"Too many queued transitions ({MAX_QUEUED_TRANSITIONS})! Possible infinite loop?");
+                logger.LogError($"Too many queued transitions ({MAX_QUEUED_TRANSITIONS})! Possible infinite loop?");
                 return;
             }
             pendingTransitions.Enqueue(id);
@@ -210,7 +238,7 @@ public class StateMachine<T> where T : Enum
 
         if (!states.TryGetValue(id, out State value))
         {
-            GD.PushWarning($"Can not change state to {id} as it does not exist");
+            logger.LogWarning($"Can not change state to {id} as it does not exist");
             return;
         }
 
@@ -249,7 +277,7 @@ public class StateMachine<T> where T : Enum
         finally
         {
             isTransitioning = false;
-            RemoveGlobalData("__transition_data__");
+            RemoveGlobalData(TRANSITION_PER_DATA);
         }
     }
 
@@ -257,13 +285,13 @@ public class StateMachine<T> where T : Enum
     {
         if (!states.TryGetValue(from, out var state))
         {
-            GD.PushError($"Can not transition as (From state) does not exist");
+            logger.LogError($"Can not transition as (From state) does not exist");
             return null;
         }
 
         if (!states.ContainsKey(to))
         {
-            GD.PushError($"Can not transition as (To state) does not exist");
+            logger.LogError($"Can not transition as (To state) does not exist");
             return null;
         }
 
@@ -276,7 +304,7 @@ public class StateMachine<T> where T : Enum
     {
         if (from == null) 
         {
-            GD.PushError("from array is null");
+            logger.LogError("from array is null");
             return;
         }
         
@@ -288,7 +316,7 @@ public class StateMachine<T> where T : Enum
     {
         if (!states.ContainsKey(to))
         {
-            GD.PushError($"Can not transition as (To state) does not exist");
+            logger.LogError($"Can not transition as (To state) does not exist");
             return null;
         }
 
@@ -303,14 +331,14 @@ public class StateMachine<T> where T : Enum
     {
         if (!states.TryGetValue(from, out var state))
         {
-            GD.PushWarning($"State with id: {from} does not exist");
+            logger.LogWarning($"State with id: {from} does not exist");
             return false;
         }
         
         int removed = state.Transitions.RemoveAll(t => t.To.Equals(to));
         
         if (removed == 0)
-            GD.PushError($"No Transition Was Found Between: {from} -> {to}");
+            logger.LogError($"No Transition Was Found Between: {from} -> {to}");
         
         ReSortTransitions();
         return removed > 0;
@@ -322,7 +350,7 @@ public class StateMachine<T> where T : Enum
 
         if (removed == 0)
         {
-            GD.PushWarning($"No Global Transition Was Found to state: {to}");
+            logger.LogWarning($"No Global Transition Was Found to state: {to}");
             return false;
         }
 
@@ -334,7 +362,7 @@ public class StateMachine<T> where T : Enum
     {
         if (!states.TryGetValue(id, out var state))
         {
-            GD.PushWarning($"State with id: {id} does not exist");
+            logger.LogWarning($"State with id: {id} does not exist");
             return;
         }
         state.Transitions.Clear();
@@ -473,10 +501,11 @@ public class StateMachine<T> where T : Enum
 
             if (!states.ContainsKey(restartId))
             {
-                GD.PushError($"RestartId {restartId} doesn't exist for state {fromId}");
+                logger.LogError($"RestartId {restartId} doesn't exist for state {fromId}");
                 return;
             }
 
+            currentState.Callback?.Invoke();
             StateTimeout?.Invoke(fromId);
             ChangeStateInternal(restartId);
             TransitionTriggered?.Invoke(fromId, restartId);
@@ -488,19 +517,19 @@ public class StateMachine<T> where T : Enum
         RebuildTransitionCache();
 
         if (cachedSortedTransitions.Count > 0)
-            CheckTransitionLoop(cachedSortedTransitions);
+            CheckTransitionLoop();
     }
 
-    private void CheckTransitionLoop(List<Transition> candidateTransitions)
+    private void CheckTransitionLoop()
     {
-        foreach (Transition transition in candidateTransitions)
+        foreach (Transition transition in activeTransitions)
         {
-            if (transition.Guard?.Invoke(this) ?? true)
+            if (!transition.Guard?.Invoke(this) ?? true)
                 continue;
             
             float requiredTime = transition.OverrideMinTime > 0f ? transition.OverrideMinTime : currentState.MinTime;
             
-            if (stateTime > requiredTime || transition.ForceInstantTransition)
+            if (stateTime <= requiredTime && !transition.ForceInstantTransition)
                 continue;
 
             if (transition.Condition?.Invoke(this) ?? false)
@@ -559,7 +588,7 @@ public class StateMachine<T> where T : Enum
 
     public bool TryGetPerTransitionData<TData>(out TData data)
     {
-        if (globalData.TryGetValue("__transition_data__", out var value) && value is TData castValue)
+        if (globalData.TryGetValue(TRANSITION_PER_DATA, out var value) && value is TData castValue)
         {
             data = castValue;
             return true;
@@ -685,6 +714,7 @@ public class StateMachine<T> where T : Enum
         public Action<double> Update { get; private set; }
         public Action Enter { get; private set; }
         public Action Exit { get; private set; }
+        public Action Callback { get; private set; }
 
         public FSMProcessMode ProcessMode { get; private set; }
         public FSMLockMode LockMode { get; private set; }
@@ -698,10 +728,7 @@ public class StateMachine<T> where T : Enum
         public Transition AddTransition(T to)
         {
             if (Transitions.Find(t => t.To.Equals(to)) != null)
-            {
-                GD.PushWarning($"Trying to add an existing transition: from: {Id} -> to: {to}");
                 return null;
-            }
 
             Transition transition = new Transition(Id, to);
             Transitions.Add(transition);
@@ -732,6 +759,12 @@ public class StateMachine<T> where T : Enum
         public State OnExit(Action exit)
         {
             Exit = exit;
+            return this;
+        }
+
+        public State OnTimeout(Action method)
+        {
+            Callback = method;
             return this;
         }
 
@@ -781,10 +814,7 @@ public class StateMachine<T> where T : Enum
         public State RegisterData(string id, object value)
         {
             if (data.ContainsKey(id))
-            {
-                GD.PushError($"Trying to add an existing data with Id: {id}");
                 return this;
-            }
             data[id] = value;
             return this;
         }
@@ -897,3 +927,4 @@ public class StateMachine<T> where T : Enum
 
 
 }
+
